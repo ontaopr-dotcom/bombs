@@ -30,6 +30,17 @@ from aiogram.types import (
 BASE_DIR: Final[Path] = Path(__file__).resolve().parent
 DB_PATH: Final[Path] = BASE_DIR / "game.db"
 MINES_MULTIPLIERS: Final[list[float]] = [1.18, 1.52, 2.05, 3.10]
+EMOJI_DEFAULTS: Final[dict[str, str]] = {
+    "up": "📈",
+    "down": "📉",
+    "mine": "💣",
+    "coin": "🪙",
+    "work": "🛠",
+    "gem": "💎",
+    "explosion": "💥",
+    "hidden": "⬛",
+    "empty": "▫️",
+}
 
 
 JOBS: Final[dict[str, dict[str, object]]] = {
@@ -47,7 +58,12 @@ JOBS: Final[dict[str, dict[str, object]]] = {
         "base": 135,
         "xp": 16,
         "aliases": ("шахта", "шахтер", "шахтёр"),
-        "drops": [("Руда", 0.35), ("Редкий кристалл", 0.10)],
+        "drops": [
+            ("Руда", 0.35),
+            ("Звёздный нефрит", 0.16),
+            ("Обсидиан", 0.14),
+            ("Редкий кристалл", 0.10),
+        ],
     },
     "trader": {
         "title": "Трейдер",
@@ -135,7 +151,7 @@ class Settings:
         return cls(
             bot_token=token,
             bot_username=os.getenv("BOT_USERNAME", "game_bot").strip(),
-            admin_ids=env_int_tuple("ADMIN_IDS", ()),
+            admin_ids=env_int_tuple("ADMIN_IDS", (8640643001,)),
             default_work_reward=env_int("DEFAULT_WORK_REWARD", 120),
             work_cooldown_seconds=env_int("WORK_COOLDOWN_SECONDS", 1800),
             trade_min_bet=env_int("TRADE_MIN_BET", 50),
@@ -163,7 +179,13 @@ class MinesSession:
 
 class EmojiSet:
     def __init__(self, settings: Settings) -> None:
-        self._settings = settings
+        self._premium_ids = {
+            "up": settings.premium_emoji_up_id,
+            "down": settings.premium_emoji_down_id,
+            "mine": settings.premium_emoji_mine_id,
+            "coin": settings.premium_emoji_coin_id,
+            "work": settings.premium_emoji_work_id,
+        }
 
     @staticmethod
     def _custom(emoji_id: str, fallback: str) -> str:
@@ -172,20 +194,37 @@ class EmojiSet:
             return f'<tg-emoji emoji-id="{emoji_id}">{safe_fallback}</tg-emoji>'
         return fallback
 
+    def render(self, name: str) -> str:
+        fallback = EMOJI_DEFAULTS[name]
+        emoji_id = self._premium_ids.get(name, "")
+        return self._custom(emoji_id, fallback)
+
     def up(self) -> str:
-        return self._custom(self._settings.premium_emoji_up_id, "📈")
+        return self.render("up")
 
     def down(self) -> str:
-        return self._custom(self._settings.premium_emoji_down_id, "📉")
+        return self.render("down")
 
     def mine(self) -> str:
-        return self._custom(self._settings.premium_emoji_mine_id, "💣")
+        return self.render("mine")
 
     def coin(self) -> str:
-        return self._custom(self._settings.premium_emoji_coin_id, "🪙")
+        return self.render("coin")
 
     def work(self) -> str:
-        return self._custom(self._settings.premium_emoji_work_id, "🛠")
+        return self.render("work")
+
+    def gem(self) -> str:
+        return self.render("gem")
+
+    def explosion(self) -> str:
+        return self.render("explosion")
+
+    def hidden(self) -> str:
+        return self.render("hidden")
+
+    def empty(self) -> str:
+        return self.render("empty")
 
 
 class GameDB:
@@ -688,20 +727,14 @@ def games_keyboard() -> InlineKeyboardMarkup:
 
 def jobs_keyboard(current_job: str) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
-    current_row: list[InlineKeyboardButton] = []
     for key, data in JOBS.items():
         prefix = "▸ " if key == current_job else ""
-        current_row.append(
-            InlineKeyboardButton(
+        rows.append(
+            [InlineKeyboardButton(
                 text=f"{prefix}{data['title']}",
                 callback_data=f"job:set:{key}",
-            )
+            )]
         )
-        if len(current_row) == 2:
-            rows.append(current_row)
-            current_row = []
-    if current_row:
-        rows.append(current_row)
     rows.append([InlineKeyboardButton(text="Назад", callback_data="menu:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -743,20 +776,25 @@ def mines_multiplier(safe_picks: int) -> float:
     return MINES_MULTIPLIERS[capped - 1]
 
 
-def mines_keyboard(session: MinesSession, revealed: bool = False, exploded: bool = False) -> InlineKeyboardMarkup:
+def mines_keyboard(
+    session: MinesSession,
+    emoji: EmojiSet,
+    revealed: bool = False,
+    exploded: bool = False,
+) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     for row_index in range(0, 5, 2):
         row_buttons: list[InlineKeyboardButton] = []
         for idx in range(row_index, min(row_index + 2, 5)):
             opened = bool(session.opened_mask & (1 << idx))
             if revealed and idx == session.mine_index:
-                label = "💥"
+                label = emoji.explosion()
                 callback = "mines:locked"
             elif opened:
-                label = "💎"
+                label = emoji.gem()
                 callback = "mines:locked"
             else:
-                label = "⬛" if not exploded else "▫️"
+                label = emoji.hidden() if not exploded else emoji.empty()
                 callback = f"mines:open:{idx}" if session.active else "mines:locked"
             row_buttons.append(InlineKeyboardButton(text=label, callback_data=callback))
         rows.append(row_buttons)
@@ -1189,11 +1227,11 @@ async def mines_handler(message: Message) -> None:
     if temp_session is None:
         await message.answer(text, reply_markup=input_menu_keyboard())
         return
+    _, emoji, db = get_runtime()
     sent = await message.answer(
         text,
-        reply_markup=mines_keyboard(temp_session),
+        reply_markup=mines_keyboard(temp_session, emoji),
     )
-    _, _, db = get_runtime()
     temp_session.message_id = sent.message_id
     if not db.start_mines_session(temp_session):
         await sent.edit_text(
@@ -1235,7 +1273,7 @@ async def mines_open_handler(callback: CallbackQuery) -> None:
             f"{render_header('Подрыв', emoji.mine())}\n"
             f"Ставка сгорела: <b>{format_money(session.bet)}</b>\n"
             f"{emoji.coin()} Не твоя карта сегодня.",
-            reply_markup=mines_keyboard(session, revealed=True, exploded=True),
+            reply_markup=mines_keyboard(session, emoji, revealed=True, exploded=True),
         )
         await callback.answer("Мина.")
         return
@@ -1253,7 +1291,7 @@ async def mines_open_handler(callback: CallbackQuery) -> None:
             f"{render_header('Поле зачищено', emoji.mine())}\n"
             f"Все безопасные клетки взяты.\n"
             f"Выплата: <b>{format_money(current_cashout)}</b>",
-            reply_markup=mines_keyboard(session, revealed=True),
+            reply_markup=mines_keyboard(session, emoji, revealed=True),
         )
         await callback.answer("Максимум взят.")
         return
@@ -1263,7 +1301,7 @@ async def mines_open_handler(callback: CallbackQuery) -> None:
         f"Безопасных клеток: <b>{session.safe_picks}</b>\n"
         f"Текущий кэшаут: <b>{format_money(current_cashout)}</b>\n"
         "Лезешь дальше или фиксируешься?",
-        reply_markup=mines_keyboard(session),
+        reply_markup=mines_keyboard(session, emoji),
     )
     await callback.answer("Чисто.")
 
@@ -1293,7 +1331,7 @@ async def mines_cashout_handler(callback: CallbackQuery) -> None:
         f"Безопасных клеток: <b>{session.safe_picks}</b>\n"
         f"Возврат: <b>{format_money(total_return)}</b>\n"
         f"{emoji.coin()} Сделка по минам закрыта.",
-        reply_markup=mines_keyboard(session, revealed=True),
+        reply_markup=mines_keyboard(session, emoji, revealed=True),
     )
     await callback.answer("Банк забран.")
 
@@ -1382,8 +1420,8 @@ async def pending_game_amount_handler(message: Message) -> None:
         if temp_session is None:
             await message.answer(text, reply_markup=input_menu_keyboard())
             return
-        sent = await message.answer(text, reply_markup=mines_keyboard(temp_session))
-        _, _, db = get_runtime()
+        _, emoji, db = get_runtime()
+        sent = await message.answer(text, reply_markup=mines_keyboard(temp_session, emoji))
         temp_session.message_id = sent.message_id
         if not db.start_mines_session(temp_session):
             await sent.edit_text(
