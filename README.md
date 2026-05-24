@@ -1,4 +1,4 @@
-# Telegram Game Bot
+# Tg bot
 
 Простой Telegram-бот с игровой экономикой:
 
@@ -47,15 +47,6 @@ python3 bot.py
 ## Inline mode
 
 После включения inline mode в BotFather можно вызывать бота так:
-
-```text
-@your_bot_username
-@your_bot_username balance
-@your_bot_username work
-@your_bot_username jobs
-@your_bot_username inventory
-@your_bot_username logs
-```
 
 ## Premium emoji
 
