@@ -1,0 +1,1560 @@
+from __future__ import annotations
+
+import asyncio
+import html
+import os
+import random
+import sqlite3
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Final
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
+
+
+BASE_DIR: Final[Path] = Path(__file__).resolve().parent
+DB_PATH: Final[Path] = BASE_DIR / "game.db"
+MINES_MULTIPLIERS: Final[list[float]] = [1.18, 1.52, 2.05, 3.10]
+
+
+JOBS: Final[dict[str, dict[str, object]]] = {
+    "courier": {
+        "title": "Курьер",
+        "flavor": "Возишь серые пакеты по району.",
+        "base": 110,
+        "xp": 18,
+        "aliases": ("курьер",),
+        "drops": [("Энерджи", 0.30), ("Чаевые", 0.20)],
+    },
+    "miner": {
+        "title": "Шахтёр",
+        "flavor": "Бьёшь жилу и тащишь руду наверх.",
+        "base": 135,
+        "xp": 16,
+        "aliases": ("шахта", "шахтер", "шахтёр"),
+        "drops": [("Руда", 0.35), ("Редкий кристалл", 0.10)],
+    },
+    "trader": {
+        "title": "Трейдер",
+        "flavor": "Ловишь импульс и продаёшь страх толпе.",
+        "base": 125,
+        "xp": 20,
+        "aliases": ("трейдер",),
+        "drops": [("Инсайд", 0.18), ("Флешка с графиками", 0.22)],
+    },
+    "hacker": {
+        "title": "Хакер",
+        "flavor": "Крутишь схемы, прокси и грязные логи.",
+        "base": 145,
+        "xp": 17,
+        "aliases": ("хакер",),
+        "drops": [("Прокси-ключ", 0.24), ("Эксплойт", 0.08)],
+    },
+}
+
+
+def resolve_job_key(raw_value: str) -> str | None:
+    normalized = raw_value.strip().lower()
+    if normalized in JOBS:
+        return normalized
+    for key, data in JOBS.items():
+        aliases = tuple(str(alias).lower() for alias in data.get("aliases", ()))
+        if normalized in aliases:
+            return key
+    return None
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip())
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def env_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw_value = os.getenv(name, "").strip()
+    if not raw_value:
+        return default
+    result: list[int] = []
+    for chunk in raw_value.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        result.append(int(item))
+    return tuple(result) if result else default
+
+
+@dataclass(frozen=True)
+class Settings:
+    bot_token: str
+    bot_username: str
+    admin_ids: tuple[int, ...]
+    default_work_reward: int
+    work_cooldown_seconds: int
+    trade_min_bet: int
+    mines_min_bet: int
+    house_edge_percent: int
+    premium_emoji_up_id: str
+    premium_emoji_down_id: str
+    premium_emoji_mine_id: str
+    premium_emoji_coin_id: str
+    premium_emoji_work_id: str
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        load_env_file(BASE_DIR / ".env")
+        token = os.getenv("BOT_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("BOT_TOKEN is not set")
+        return cls(
+            bot_token=token,
+            bot_username=os.getenv("BOT_USERNAME", "game_bot").strip(),
+            admin_ids=env_int_tuple("ADMIN_IDS", ()),
+            default_work_reward=env_int("DEFAULT_WORK_REWARD", 120),
+            work_cooldown_seconds=env_int("WORK_COOLDOWN_SECONDS", 1800),
+            trade_min_bet=env_int("TRADE_MIN_BET", 50),
+            mines_min_bet=env_int("MINES_MIN_BET", 50),
+            house_edge_percent=env_int("HOUSE_EDGE_PERCENT", 8),
+            premium_emoji_up_id=os.getenv("PREMIUM_EMOJI_UP_ID", "").strip(),
+            premium_emoji_down_id=os.getenv("PREMIUM_EMOJI_DOWN_ID", "").strip(),
+            premium_emoji_mine_id=os.getenv("PREMIUM_EMOJI_MINE_ID", "").strip(),
+            premium_emoji_coin_id=os.getenv("PREMIUM_EMOJI_COIN_ID", "").strip(),
+            premium_emoji_work_id=os.getenv("PREMIUM_EMOJI_WORK_ID", "").strip(),
+        )
+
+
+@dataclass
+class MinesSession:
+    user_id: int
+    chat_id: int
+    message_id: int
+    bet: int
+    mine_index: int
+    safe_picks: int
+    opened_mask: int
+    active: int
+
+
+class EmojiSet:
+    def __init__(self, settings: Settings) -> None:
+        self._settings = settings
+
+    @staticmethod
+    def _custom(emoji_id: str, fallback: str) -> str:
+        if emoji_id:
+            safe_fallback = html.escape(fallback)
+            return f'<tg-emoji emoji-id="{emoji_id}">{safe_fallback}</tg-emoji>'
+        return fallback
+
+    def up(self) -> str:
+        return self._custom(self._settings.premium_emoji_up_id, "📈")
+
+    def down(self) -> str:
+        return self._custom(self._settings.premium_emoji_down_id, "📉")
+
+    def mine(self) -> str:
+        return self._custom(self._settings.premium_emoji_mine_id, "💣")
+
+    def coin(self) -> str:
+        return self._custom(self._settings.premium_emoji_coin_id, "🪙")
+
+    def work(self) -> str:
+        return self._custom(self._settings.premium_emoji_work_id, "🛠")
+
+
+class GameDB:
+    def __init__(self, path: Path) -> None:
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+        self._init_db()
+
+    def _init_db(self) -> None:
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                balance INTEGER NOT NULL DEFAULT 1000,
+                last_work_at INTEGER NOT NULL DEFAULT 0,
+                xp INTEGER NOT NULL DEFAULT 0,
+                level INTEGER NOT NULL DEFAULT 1,
+                current_job TEXT NOT NULL DEFAULT 'courier'
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS game_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                game_type TEXT NOT NULL,
+                bet INTEGER NOT NULL,
+                payout INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS work_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                job_key TEXT NOT NULL,
+                reward INTEGER NOT NULL,
+                xp_gain INTEGER NOT NULL,
+                item_drop TEXT,
+                level_before INTEGER NOT NULL,
+                level_after INTEGER NOT NULL,
+                balance_after INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inventory (
+                user_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, item_name)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mines_sessions (
+                user_id INTEGER PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                bet INTEGER NOT NULL,
+                mine_index INTEGER NOT NULL,
+                safe_picks INTEGER NOT NULL DEFAULT 0,
+                opened_mask INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
+        self._ensure_user_columns()
+        self.conn.commit()
+
+    def _ensure_user_columns(self) -> None:
+        columns = {
+            row["name"] for row in self.conn.execute("PRAGMA table_info(users)").fetchall()
+        }
+        if "xp" not in columns:
+            self.conn.execute("ALTER TABLE users ADD COLUMN xp INTEGER NOT NULL DEFAULT 0")
+        if "level" not in columns:
+            self.conn.execute("ALTER TABLE users ADD COLUMN level INTEGER NOT NULL DEFAULT 1")
+        if "current_job" not in columns:
+            self.conn.execute(
+                "ALTER TABLE users ADD COLUMN current_job TEXT NOT NULL DEFAULT 'courier'"
+            )
+
+    def ensure_user(self, user_id: int, username: str | None) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO users (user_id, username)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = CASE
+                    WHEN excluded.username = '' THEN users.username
+                    ELSE excluded.username
+                END
+            """,
+            (user_id, username or ""),
+        )
+        self.conn.commit()
+
+    def get_user(self, user_id: int) -> sqlite3.Row:
+        row = self.conn.execute(
+            """
+            SELECT user_id, username, balance, last_work_at, xp, level, current_job
+            FROM users
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"user {user_id} was not initialized")
+        return row
+
+    def add_balance(self, user_id: int, amount: int) -> int:
+        self.conn.execute(
+            "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+            (amount, user_id),
+        )
+        self.conn.commit()
+        return int(self.get_user(user_id)["balance"])
+
+    def set_last_work_at(self, user_id: int, timestamp: int) -> None:
+        self.conn.execute(
+            "UPDATE users SET last_work_at = ? WHERE user_id = ?",
+            (timestamp, user_id),
+        )
+        self.conn.commit()
+
+    def set_job(self, user_id: int, job_key: str) -> None:
+        self.conn.execute(
+            "UPDATE users SET current_job = ? WHERE user_id = ?",
+            (job_key, user_id),
+        )
+        self.conn.commit()
+
+    def add_xp(self, user_id: int, gained_xp: int) -> tuple[int, int, bool]:
+        user = self.get_user(user_id)
+        old_level = int(user["level"])
+        new_xp = int(user["xp"]) + gained_xp
+        new_level = xp_to_level(new_xp)
+        self.conn.execute(
+            "UPDATE users SET xp = ?, level = ? WHERE user_id = ?",
+            (new_xp, new_level, user_id),
+        )
+        self.conn.commit()
+        return new_xp, new_level, new_level > old_level
+
+    def add_item(self, user_id: int, item_name: str, quantity: int = 1) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO inventory (user_id, item_name, quantity)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, item_name)
+            DO UPDATE SET quantity = quantity + excluded.quantity
+            """,
+            (user_id, item_name, quantity),
+        )
+        self.conn.commit()
+
+    def get_inventory(self, user_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT item_name, quantity
+            FROM inventory
+            WHERE user_id = ? AND quantity > 0
+            ORDER BY quantity DESC, item_name ASC
+            """,
+            (user_id,),
+        ).fetchall()
+
+    def log_game(self, user_id: int, game_type: str, bet: int, payout: int) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO game_log (user_id, game_type, bet, payout, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, game_type, bet, payout, int(time.time())),
+        )
+        self.conn.commit()
+
+    def log_work(
+        self,
+        user_id: int,
+        job_key: str,
+        reward: int,
+        xp_gain: int,
+        item_drop: str | None,
+        level_before: int,
+        level_after: int,
+        balance_after: int,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO work_log (
+                user_id, job_key, reward, xp_gain, item_drop,
+                level_before, level_after, balance_after, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                job_key,
+                reward,
+                xp_gain,
+                item_drop,
+                level_before,
+                level_after,
+                balance_after,
+                int(time.time()),
+            ),
+        )
+        self.conn.commit()
+
+    def get_recent_work_logs(self, user_id: int, limit: int = 6) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT id, user_id, job_key, reward, xp_gain, item_drop,
+                   level_before, level_after, balance_after, created_at
+            FROM work_log
+            WHERE user_id = ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        ).fetchall()
+
+    def get_active_mines_session(self, user_id: int) -> MinesSession | None:
+        row = self.conn.execute(
+            """
+            SELECT user_id, chat_id, message_id, bet, mine_index, safe_picks, opened_mask, active
+            FROM mines_sessions
+            WHERE user_id = ? AND active = 1
+            """,
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return MinesSession(**dict(row))
+
+    def upsert_mines_session(
+        self,
+        user_id: int,
+        chat_id: int,
+        message_id: int,
+        bet: int,
+        mine_index: int,
+        safe_picks: int = 0,
+        opened_mask: int = 0,
+        active: int = 1,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO mines_sessions (
+                user_id, chat_id, message_id, bet, mine_index, safe_picks, opened_mask, active
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                message_id = excluded.message_id,
+                bet = excluded.bet,
+                mine_index = excluded.mine_index,
+                safe_picks = excluded.safe_picks,
+                opened_mask = excluded.opened_mask,
+                active = excluded.active
+            """,
+            (user_id, chat_id, message_id, bet, mine_index, safe_picks, opened_mask, active),
+        )
+        self.conn.commit()
+
+    def update_mines_progress(self, user_id: int, safe_picks: int, opened_mask: int) -> None:
+        self.conn.execute(
+            """
+            UPDATE mines_sessions
+            SET safe_picks = ?, opened_mask = ?
+            WHERE user_id = ?
+            """,
+            (safe_picks, opened_mask, user_id),
+        )
+        self.conn.commit()
+
+    def close_mines_session(self, user_id: int) -> None:
+        self.conn.execute(
+            "UPDATE mines_sessions SET active = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+        self.conn.commit()
+
+    def start_mines_session(self, session: MinesSession) -> bool:
+        try:
+            with self.conn:
+                active_session = self.conn.execute(
+                    """
+                    SELECT 1
+                    FROM mines_sessions
+                    WHERE user_id = ? AND active = 1
+                    """,
+                    (session.user_id,),
+                ).fetchone()
+                if active_session is not None:
+                    return False
+
+                balance_row = self.conn.execute(
+                    "SELECT balance FROM users WHERE user_id = ?",
+                    (session.user_id,),
+                ).fetchone()
+                if balance_row is None or int(balance_row["balance"]) < session.bet:
+                    return False
+
+                self.conn.execute(
+                    "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+                    (session.bet, session.user_id),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO mines_sessions (
+                        user_id, chat_id, message_id, bet, mine_index, safe_picks, opened_mask, active
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id) DO UPDATE SET
+                        chat_id = excluded.chat_id,
+                        message_id = excluded.message_id,
+                        bet = excluded.bet,
+                        mine_index = excluded.mine_index,
+                        safe_picks = excluded.safe_picks,
+                        opened_mask = excluded.opened_mask,
+                        active = excluded.active
+                    """,
+                    (
+                        session.user_id,
+                        session.chat_id,
+                        session.message_id,
+                        session.bet,
+                        session.mine_index,
+                        session.safe_picks,
+                        session.opened_mask,
+                        session.active,
+                    ),
+                )
+        except sqlite3.Error:
+            return False
+        return True
+
+
+def format_money(amount: int) -> str:
+    return f"{amount:,}".replace(",", " ")
+
+
+def seconds_to_text(seconds: int) -> str:
+    minutes, sec = divmod(max(seconds, 0), 60)
+    hours, minutes = divmod(minutes, 60)
+    parts: list[str] = []
+    if hours:
+        parts.append(f"{hours}ч")
+    if minutes:
+        parts.append(f"{minutes}м")
+    if sec or not parts:
+        parts.append(f"{sec}с")
+    return " ".join(parts)
+
+
+def parse_bet(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        bet = int(raw.replace("_", ""))
+    except ValueError:
+        return None
+    return bet if bet > 0 else None
+
+
+def parse_user_id(raw: str | None) -> int | None:
+    if raw is None:
+        return None
+    try:
+        user_id = int(raw.strip())
+    except ValueError:
+        return None
+    return user_id if user_id > 0 else None
+
+
+def xp_to_level(xp: int) -> int:
+    return max(1, 1 + xp // 100)
+
+
+def xp_to_next_level(level: int) -> int:
+    return 100
+
+
+def render_header(title: str, emoji: str) -> str:
+    return f"{emoji} <b>{html.escape(title)}</b>"
+
+
+def format_timestamp(timestamp: int) -> str:
+    return time.strftime("%d.%m %H:%M", time.localtime(timestamp))
+
+
+def render_profile_block(user: sqlite3.Row) -> str:
+    job_key = str(user["current_job"])
+    job = JOBS.get(job_key, JOBS["courier"])
+    level = int(user["level"])
+    xp = int(user["xp"])
+    current_band = xp - ((level - 1) * 100)
+    return (
+        f"Уровень: <b>{level}</b> ({current_band}/{xp_to_next_level(level)})\n"
+        f"Работа: <b>{html.escape(str(job['title']))}</b>"
+    )
+
+
+def render_work_log_entry(row: sqlite3.Row) -> str:
+    job = JOBS.get(str(row["job_key"]), JOBS["courier"])
+    parts = [
+        f"• <b>{format_timestamp(int(row['created_at']))}</b> - {html.escape(str(job['title']))}",
+        f"+{format_money(int(row['reward']))} кэша, +{int(row['xp_gain'])} XP",
+    ]
+    if int(row["level_after"]) > int(row["level_before"]):
+        parts.append(f"lvl {int(row['level_before'])} -> {int(row['level_after'])}")
+    if row["item_drop"]:
+        parts.append(f"лут: {html.escape(str(row['item_drop']))}")
+    parts.append(f"баланс: {format_money(int(row['balance_after']))}")
+    return " | ".join(parts)
+
+
+def render_balance_text(user: sqlite3.Row, emoji: EmojiSet) -> str:
+    return (
+        f"{render_header('Баланс', emoji.coin())}\n"
+        f"Кэш: <b>{format_money(int(user['balance']))}</b>\n"
+        f"{render_profile_block(user)}"
+    )
+
+
+def render_jobs_text(user: sqlite3.Row, emoji: EmojiSet) -> str:
+    lines = [render_header("Профессии", emoji.work())]
+    for key, data in JOBS.items():
+        mark = "▸" if key == str(user["current_job"]) else "•"
+        aliases = ", ".join(
+            f"<code>{html.escape(str(alias))}</code>" for alias in data.get("aliases", ())
+        )
+        alias_suffix = f" (или {aliases})" if aliases else ""
+        lines.append(
+            f"{mark} <code>{key}</code> - <b>{html.escape(str(data['title']))}</b>, "
+            f"{html.escape(str(data['flavor']))}{alias_suffix}"
+        )
+    lines.append("\nСменить можно кнопками ниже или через <code>/job trader</code>.")
+    return "\n".join(lines)
+
+
+def render_inventory_text(items: list[sqlite3.Row], emoji: EmojiSet) -> str:
+    if not items:
+        return f"{render_header('Инвентарь', emoji.coin())}\nПока пусто. Иди в <code>/work</code>."
+    lines = [render_header("Инвентарь", emoji.coin())]
+    for item in items[:12]:
+        lines.append(f"• {html.escape(str(item['item_name']))} x<b>{int(item['quantity'])}</b>")
+    return "\n".join(lines)
+
+
+def render_worklog_text(target_user_id: int, rows: list[sqlite3.Row], emoji: EmojiSet) -> str:
+    if not rows:
+        return (
+            f"{render_header('Логи смен', emoji.work())}\n"
+            f"Для пользователя <code>{target_user_id}</code> записей пока нет."
+        )
+    lines = [
+        render_header("Логи смен", emoji.work()),
+        f"Пользователь: <code>{target_user_id}</code>",
+    ]
+    for row in rows:
+        lines.append(render_work_log_entry(row))
+    return "\n".join(lines)
+
+
+def input_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Баланс"), KeyboardButton(text="Работа")],
+            [KeyboardButton(text="Игры"), KeyboardButton(text="Профессии")],
+            [KeyboardButton(text="Инвентарь"), KeyboardButton(text="Логи смен")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выбери раздел или введи команду",
+    )
+
+
+def games_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Трейд", callback_data="game:trade"),
+            ],
+            [
+                InlineKeyboardButton(text="Мины", callback_data="game:mines"),
+            ],
+        ]
+    )
+
+
+def jobs_keyboard(current_job: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for key, data in JOBS.items():
+        prefix = "▸ " if key == current_job else ""
+        current_row.append(
+            InlineKeyboardButton(
+                text=f"{prefix}{data['title']}",
+                callback_data=f"job:set:{key}",
+            )
+        )
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="menu:close")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def trade_round(bet: int, direction: str, house_edge_percent: int) -> tuple[bool, int, float]:
+    edge = min(max(house_edge_percent / 200, 0.0), 0.2)
+    won = random.random() < (0.5 - edge)
+    delta_magnitude = round(random.uniform(0.15, 4.8), 2)
+    if direction == "up":
+        delta = delta_magnitude if won else -delta_magnitude
+    else:
+        delta = -delta_magnitude if won else delta_magnitude
+    payout = bet if won else -bet
+    return won, payout, delta
+
+
+def roll_job_reward(user: sqlite3.Row, runtime_settings: Settings) -> tuple[int, int, str, str | None]:
+    job_key = str(user["current_job"])
+    job = JOBS.get(job_key, JOBS["courier"])
+    level = int(user["level"])
+    base = int(job["base"])
+    xp_gain = int(job["xp"]) + random.randint(2, 7)
+    level_bonus = 1 + ((level - 1) * 0.08)
+    volatility = random.uniform(0.85, 1.45)
+    payout = int((base + runtime_settings.default_work_reward * 0.25) * level_bonus * volatility)
+    flavor = str(job["flavor"])
+    item_drop = None
+    for item_name, chance in job["drops"]:
+        if random.random() <= float(chance):
+            item_drop = str(item_name)
+            break
+    return payout, xp_gain, flavor, item_drop
+
+
+def mines_multiplier(safe_picks: int) -> float:
+    if safe_picks <= 0:
+        return 1.0
+    capped = min(safe_picks, len(MINES_MULTIPLIERS))
+    return MINES_MULTIPLIERS[capped - 1]
+
+
+def mines_keyboard(session: MinesSession, revealed: bool = False, exploded: bool = False) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for row_index in range(0, 5, 2):
+        row_buttons: list[InlineKeyboardButton] = []
+        for idx in range(row_index, min(row_index + 2, 5)):
+            opened = bool(session.opened_mask & (1 << idx))
+            if revealed and idx == session.mine_index:
+                label = "💥"
+                callback = "mines:locked"
+            elif opened:
+                label = "💎"
+                callback = "mines:locked"
+            else:
+                label = "⬛" if not exploded else "▫️"
+                callback = f"mines:open:{idx}" if session.active else "mines:locked"
+            row_buttons.append(InlineKeyboardButton(text=label, callback_data=callback))
+        rows.append(row_buttons)
+
+    if session.active:
+        cashout_label = "Забрать банк"
+        if session.safe_picks > 0:
+            cashout_amount = int(session.bet * mines_multiplier(session.safe_picks))
+            cashout_label = f"Забрать {format_money(cashout_amount)}"
+        rows.append(
+            [InlineKeyboardButton(text=cashout_label, callback_data="mines:cashout")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+router = Router()
+settings: Settings | None = None
+emoji_set: EmojiSet | None = None
+db: GameDB | None = None
+pending_game_actions: dict[int, str] = {}
+
+
+def get_runtime() -> tuple[Settings, EmojiSet, GameDB]:
+    if settings is None or emoji_set is None or db is None:
+        raise RuntimeError("Runtime is not initialized")
+    return settings, emoji_set, db
+
+
+def is_admin(user_id: int, runtime_settings: Settings) -> bool:
+    return user_id in runtime_settings.admin_ids
+
+
+def build_inline_article(
+    article_id: str,
+    title: str,
+    description: str,
+    message_text: str,
+) -> InlineQueryResultArticle:
+    return InlineQueryResultArticle(
+        id=article_id,
+        title=title,
+        description=description,
+        input_message_content=InputTextMessageContent(
+            message_text=message_text,
+            parse_mode=ParseMode.HTML,
+        ),
+    )
+
+
+def perform_work_action(user_id: int, username: str | None) -> tuple[str, bool]:
+    runtime_settings, emoji, db = get_runtime()
+    db.ensure_user(user_id, username)
+    user = db.get_user(user_id)
+    job_key = str(user["current_job"])
+    now = int(time.time())
+    next_available = int(user["last_work_at"]) + runtime_settings.work_cooldown_seconds
+    if now < next_available:
+        wait_for = seconds_to_text(next_available - now)
+        return (
+            f"{render_header('Смена закрыта', emoji.work())}\n"
+            f"Ты уже в кэше. Возвращайся через <b>{wait_for}</b>.",
+            False,
+        )
+
+    reward, xp_gain, flavor, item_drop = roll_job_reward(user, runtime_settings)
+    old_level = int(user["level"])
+    new_balance = db.add_balance(user_id, reward)
+    db.set_last_work_at(user_id, now)
+    _, new_level, leveled_up = db.add_xp(user_id, xp_gain)
+    if item_drop is not None:
+        db.add_item(user_id, item_drop)
+    db.log_game(user_id, "work", 0, reward)
+    db.log_work(
+        user_id=user_id,
+        job_key=job_key,
+        reward=reward,
+        xp_gain=xp_gain,
+        item_drop=item_drop,
+        level_before=old_level,
+        level_after=new_level,
+        balance_after=new_balance,
+    )
+
+    user_after = db.get_user(user_id)
+    lines = [
+        render_header("Смена завершена", emoji.work()),
+        html.escape(flavor),
+        f"Доход: <b>+{format_money(reward)}</b>",
+        f"XP: <b>+{xp_gain}</b>",
+        f"{emoji.coin()} Баланс: <b>{format_money(new_balance)}</b>",
+        f"Уровень: <b>{int(user_after['level'])}</b>",
+    ]
+    if item_drop is not None:
+        lines.append(f"Лут: <b>{html.escape(item_drop)}</b>")
+    if leveled_up:
+        lines.append(f"Новый ранг: <b>уровень {new_level}</b>")
+    return "\n".join(lines), True
+
+
+def perform_trade_action(
+    user_id: int,
+    username: str | None,
+    bet: int,
+    direction: str | None,
+) -> str:
+    runtime_settings, emoji, db = get_runtime()
+    db.ensure_user(user_id, username)
+    if bet < runtime_settings.trade_min_bet:
+        return f"Минимальная ставка для трейда: <b>{runtime_settings.trade_min_bet}</b>"
+    if direction is None:
+        direction = random.choice(["up", "down"])
+    if direction not in {"up", "down"}:
+        return "Направление только <code>up</code> или <code>down</code>."
+
+    user = db.get_user(user_id)
+    balance = int(user["balance"])
+    if balance < bet:
+        return f"Недостаточно средств. Баланс: <b>{format_money(balance)}</b>"
+
+    won, payout, delta = trade_round(bet, direction, runtime_settings.house_edge_percent)
+    new_balance = db.add_balance(user_id, payout)
+    db.log_game(user_id, "trade", bet, payout)
+    direction_emoji = emoji.up() if direction == "up" else emoji.down()
+    direction_label = "up" if direction == "up" else "down"
+    result_line = "Импульс пойман." if won else "Ликвидность вынесла твою сторону."
+    change_sign = "+" if delta >= 0 else ""
+    money_sign = "+" if payout >= 0 else ""
+    return (
+        f"{render_header('Сделка закрыта', direction_emoji)}\n"
+        f"Ставка: <b>{format_money(bet)}</b>\n"
+        f"Сценарий: <b>{direction_label}</b>\n"
+        f"Свеча: <b>{change_sign}{delta:.2f}%</b>\n"
+        f"P&amp;L: <b>{money_sign}{format_money(payout)}</b>\n"
+        f"{result_line}\n"
+        f"{emoji.coin()} Баланс: <b>{format_money(new_balance)}</b>"
+    )
+
+
+def prepare_mines_action(
+    user_id: int,
+    username: str | None,
+    chat_id: int,
+    bet: int,
+) -> tuple[str, MinesSession | None]:
+    runtime_settings, emoji, db = get_runtime()
+    db.ensure_user(user_id, username)
+    if bet < runtime_settings.mines_min_bet:
+        return f"Минимальная ставка для мин: <b>{runtime_settings.mines_min_bet}</b>", None
+
+    existing = db.get_active_mines_session(user_id)
+    if existing is not None:
+        return "У тебя уже открыта сессия мин. Доиграй её или забери банк в старом сообщении.", None
+
+    user = db.get_user(user_id)
+    balance = int(user["balance"])
+    if balance < bet:
+        return f"Недостаточно средств. Баланс: <b>{format_money(balance)}</b>", None
+
+    mine_index = random.randint(0, 4)
+    temp_session = MinesSession(
+        user_id=user_id,
+        chat_id=chat_id,
+        message_id=0,
+        bet=bet,
+        mine_index=mine_index,
+        safe_picks=0,
+        opened_mask=0,
+        active=1,
+    )
+    text = (
+        f"{render_header('Минное поле открыто', emoji.mine())}\n"
+        f"Ставка списана: <b>{format_money(bet)}</b>\n"
+        "Открывай клетки. После каждой безопасной клетки можешь забрать банк."
+    )
+    return text, temp_session
+
+
+@router.message(CommandStart())
+async def start_handler(message: Message) -> None:
+    runtime_settings, emoji, db = get_runtime()
+    assert message.from_user is not None
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    user = db.get_user(message.from_user.id)
+    text = (
+        f"{render_header('Подпольный терминал запущен', emoji.coin())}\n"
+        f"Стартовый баланс: <b>{format_money(int(user['balance']))}</b>\n"
+        f"{render_profile_block(user)}\n\n"
+        "Команды:\n"
+        "/balance\n"
+        "/work\n"
+        "/job\n"
+        "/inventory\n"
+        "/trade 200\n"
+        "/mines 300\n\n"
+        f"Юзернейм бота: <code>{html.escape(runtime_settings.bot_username)}</code>"
+    )
+    await message.answer(text, reply_markup=input_menu_keyboard())
+
+
+@router.message(Command("help"))
+async def help_handler(message: Message) -> None:
+    runtime_settings, emoji, _ = get_runtime()
+    admin_lines = ""
+    if message.from_user is not None and is_admin(message.from_user.id, runtime_settings):
+        admin_lines = (
+            "\n\nАдмин:\n"
+            "/give &lt;user_id&gt; &lt;amount&gt; - выдать деньги\n"
+            "/resetwork &lt;user_id&gt; - сбросить кулдаун работы\n"
+            "/worklog &lt;user_id&gt; - логи смен пользователя"
+        )
+    text = (
+        f"{render_header('Режимы', emoji.work())}\n"
+        "/work - отработать смену и получить XP\n"
+        "/balance - баланс, уровень и текущая профессия\n"
+        "/job - список профессий\n"
+        "/worklog - последние смены\n"
+        "/job trader - сменить профессию\n"
+        "/inventory - показать предметы\n"
+        "/emoji_debug - как снять custom_emoji_id\n"
+        "/trade &lt;ставка&gt; - быстрая сделка\n"
+        "/mines &lt;ставка&gt; - открыть интерактивное поле с минами"
+        f"{admin_lines}"
+    )
+    await message.answer(text, reply_markup=input_menu_keyboard())
+
+
+@router.message(Command("give"))
+async def give_handler(message: Message) -> None:
+    runtime_settings, emoji, db = get_runtime()
+    assert message.from_user is not None
+    if not is_admin(message.from_user.id, runtime_settings):
+        await message.answer("Команда только для админа.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 3:
+        await message.answer("Использование: <code>/give 123456789 5000</code>")
+        return
+
+    target_user_id = parse_user_id(parts[1])
+    amount = parse_bet(parts[2])
+    if target_user_id is None:
+        await message.answer("Некорректный user_id.")
+        return
+    if amount is None:
+        await message.answer("Сумма должна быть положительным числом.")
+        return
+
+    db.ensure_user(target_user_id, None)
+    new_balance = db.add_balance(target_user_id, amount)
+    db.log_game(target_user_id, "admin_give", 0, amount)
+    await message.answer(
+        f"{render_header('Выдача выполнена', emoji.coin())}\n"
+        f"Пользователь: <code>{target_user_id}</code>\n"
+        f"Зачислено: <b>+{format_money(amount)}</b>\n"
+        f"Новый баланс: <b>{format_money(new_balance)}</b>"
+    )
+
+
+@router.message(Command("resetwork"))
+async def resetwork_handler(message: Message) -> None:
+    runtime_settings, emoji, db = get_runtime()
+    assert message.from_user is not None
+    if not is_admin(message.from_user.id, runtime_settings):
+        await message.answer("Команда только для админа.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Использование: <code>/resetwork 123456789</code>")
+        return
+
+    target_user_id = parse_user_id(parts[1])
+    if target_user_id is None:
+        await message.answer("Некорректный user_id.")
+        return
+
+    db.ensure_user(target_user_id, None)
+    db.set_last_work_at(target_user_id, 0)
+    await message.answer(
+        f"{render_header('Кулдаун сброшен', emoji.work())}\n"
+        f"Пользователь: <code>{target_user_id}</code>\n"
+        "Теперь он может сразу использовать <code>/work</code>."
+    )
+
+
+@router.message(Command("balance"))
+@router.message(F.text.lower() == "баланс")
+async def balance_handler(message: Message) -> None:
+    _, emoji, db = get_runtime()
+    assert message.from_user is not None
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    user = db.get_user(message.from_user.id)
+    await message.answer(render_balance_text(user, emoji), reply_markup=input_menu_keyboard())
+
+
+@router.message(Command("worklog"))
+@router.message(F.text.lower() == "логи смен")
+async def worklog_handler(message: Message) -> None:
+    runtime_settings, emoji, db = get_runtime()
+    assert message.from_user is not None
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    raw_text = (message.text or "").strip()
+    parts = raw_text.split()
+
+    target_user_id = message.from_user.id
+    if raw_text.lower() != "логи смен" and len(parts) > 1:
+        if not is_admin(message.from_user.id, runtime_settings):
+            await message.answer("Чужие логи доступны только админу.")
+            return
+        parsed_user_id = parse_user_id(parts[1])
+        if parsed_user_id is None:
+            await message.answer("Некорректный user_id.")
+            return
+        target_user_id = parsed_user_id
+        db.ensure_user(target_user_id, None)
+
+    rows = db.get_recent_work_logs(target_user_id)
+    await message.answer(
+        render_worklog_text(target_user_id, rows, emoji),
+        reply_markup=input_menu_keyboard(),
+    )
+
+
+@router.message(Command("job"))
+@router.message(F.text.lower() == "профессии")
+async def job_handler(message: Message) -> None:
+    _, emoji, db = get_runtime()
+    assert message.from_user is not None
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    parts = (message.text or "").split(maxsplit=1)
+    user = db.get_user(message.from_user.id)
+
+    if len(parts) == 1:
+        await message.answer(
+            render_jobs_text(user, emoji),
+            reply_markup=jobs_keyboard(str(user["current_job"])),
+        )
+        return
+
+    job_key = resolve_job_key(parts[1])
+    if job_key is None:
+        await message.answer("Такой профессии нет. Открой <code>/job</code> и выбери из списка.")
+        return
+    db.set_job(message.from_user.id, job_key)
+    job = JOBS[job_key]
+    await message.answer(
+        f"{render_header('Профессия обновлена', emoji.work())}\n"
+        f"Теперь ты: <b>{html.escape(str(job['title']))}</b>\n"
+        f"{html.escape(str(job['flavor']))}",
+        reply_markup=jobs_keyboard(job_key),
+    )
+
+
+@router.message(Command("inventory"))
+@router.message(F.text.lower() == "инвентарь")
+async def inventory_handler(message: Message) -> None:
+    _, emoji, db = get_runtime()
+    assert message.from_user is not None
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    items = db.get_inventory(message.from_user.id)
+    await message.answer(render_inventory_text(items, emoji), reply_markup=input_menu_keyboard())
+
+
+@router.message(Command("emoji_debug"))
+async def emoji_debug_handler(message: Message) -> None:
+    await message.answer(
+        "Пришли следующим сообщением premium/custom emoji.\n"
+        "Я верну его <code>custom_emoji_id</code>, который потом можно вставить в <code>.env</code>."
+    )
+
+
+@router.message(Command("work"))
+@router.message(F.text.lower() == "работа")
+async def work_handler(message: Message) -> None:
+    assert message.from_user is not None
+    text, _ = perform_work_action(message.from_user.id, message.from_user.username)
+    await message.answer(text, reply_markup=input_menu_keyboard())
+
+
+@router.message(F.text.lower() == "игры")
+async def games_menu_handler(message: Message) -> None:
+    await message.answer(
+        "Выбери мини-игру. После выбора я попрошу сумму следующим сообщением.",
+        reply_markup=games_keyboard(),
+    )
+
+
+@router.message(Command("trade"))
+@router.message(F.text.startswith("/trade@"))
+async def trade_handler(message: Message) -> None:
+    assert message.from_user is not None
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: <code>/trade 200</code>",
+            reply_markup=input_menu_keyboard(),
+        )
+        return
+
+    bet = parse_bet(parts[1])
+    direction = parts[2].lower() if len(parts) > 2 else None
+    if bet is None:
+        await message.answer("Ставка должна быть положительным числом.", reply_markup=input_menu_keyboard())
+        return
+
+    text = perform_trade_action(message.from_user.id, message.from_user.username, bet, direction)
+    await message.answer(text, reply_markup=input_menu_keyboard())
+
+
+@router.message(Command("mines"))
+async def mines_handler(message: Message) -> None:
+    assert message.from_user is not None
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Использование: <code>/mines 300</code>", reply_markup=input_menu_keyboard())
+        return
+
+    bet = parse_bet(parts[1])
+    if bet is None:
+        await message.answer("Ставка должна быть положительным числом.", reply_markup=input_menu_keyboard())
+        return
+
+    text, temp_session = prepare_mines_action(
+        message.from_user.id,
+        message.from_user.username,
+        message.chat.id,
+        bet,
+    )
+    if temp_session is None:
+        await message.answer(text, reply_markup=input_menu_keyboard())
+        return
+    sent = await message.answer(
+        text,
+        reply_markup=mines_keyboard(temp_session),
+    )
+    _, _, db = get_runtime()
+    temp_session.message_id = sent.message_id
+    if not db.start_mines_session(temp_session):
+        await sent.edit_text(
+            "Не удалось открыть сессию. Проверь баланс и попробуй снова.",
+            reply_markup=None,
+        )
+
+
+@router.callback_query(F.data == "mines:locked")
+async def mines_locked_handler(callback: CallbackQuery) -> None:
+    await callback.answer("Эта клетка уже закрыта.")
+
+
+@router.callback_query(F.data.startswith("mines:open:"))
+async def mines_open_handler(callback: CallbackQuery) -> None:
+    _, emoji, db = get_runtime()
+    assert callback.from_user is not None
+    session = db.get_active_mines_session(callback.from_user.id)
+    if session is None:
+        await callback.answer("Сессия не найдена.", show_alert=True)
+        return
+    if callback.message is None or callback.message.message_id != session.message_id:
+        await callback.answer("Играй в актуальном сообщении.", show_alert=True)
+        return
+
+    cell_index = int(str(callback.data).split(":")[-1])
+    if session.opened_mask & (1 << cell_index):
+        await callback.answer("Эта клетка уже открыта.")
+        return
+
+    new_mask = session.opened_mask | (1 << cell_index)
+    if cell_index == session.mine_index:
+        session.opened_mask = new_mask
+        session.active = 0
+        db.update_mines_progress(session.user_id, session.safe_picks, new_mask)
+        db.close_mines_session(session.user_id)
+        db.log_game(session.user_id, "mines", session.bet, -session.bet)
+        await callback.message.edit_text(
+            f"{render_header('Подрыв', emoji.mine())}\n"
+            f"Ставка сгорела: <b>{format_money(session.bet)}</b>\n"
+            f"{emoji.coin()} Не твоя карта сегодня.",
+            reply_markup=mines_keyboard(session, revealed=True, exploded=True),
+        )
+        await callback.answer("Мина.")
+        return
+
+    session.safe_picks += 1
+    session.opened_mask = new_mask
+    db.update_mines_progress(session.user_id, session.safe_picks, new_mask)
+    current_cashout = int(session.bet * mines_multiplier(session.safe_picks))
+    if session.safe_picks >= len(MINES_MULTIPLIERS):
+        session.active = 0
+        db.close_mines_session(session.user_id)
+        db.add_balance(session.user_id, current_cashout)
+        db.log_game(session.user_id, "mines", session.bet, current_cashout - session.bet)
+        await callback.message.edit_text(
+            f"{render_header('Поле зачищено', emoji.mine())}\n"
+            f"Все безопасные клетки взяты.\n"
+            f"Выплата: <b>{format_money(current_cashout)}</b>",
+            reply_markup=mines_keyboard(session, revealed=True),
+        )
+        await callback.answer("Максимум взят.")
+        return
+
+    await callback.message.edit_text(
+        f"{render_header('Поле живо', emoji.mine())}\n"
+        f"Безопасных клеток: <b>{session.safe_picks}</b>\n"
+        f"Текущий кэшаут: <b>{format_money(current_cashout)}</b>\n"
+        "Лезешь дальше или фиксируешься?",
+        reply_markup=mines_keyboard(session),
+    )
+    await callback.answer("Чисто.")
+
+
+@router.callback_query(F.data == "mines:cashout")
+async def mines_cashout_handler(callback: CallbackQuery) -> None:
+    _, emoji, db = get_runtime()
+    assert callback.from_user is not None
+    session = db.get_active_mines_session(callback.from_user.id)
+    if session is None:
+        await callback.answer("Нет активной игры.", show_alert=True)
+        return
+    if callback.message is None or callback.message.message_id != session.message_id:
+        await callback.answer("Это не та сессия.", show_alert=True)
+        return
+    if session.safe_picks == 0:
+        await callback.answer("Сначала открой хотя бы одну безопасную клетку.", show_alert=True)
+        return
+
+    total_return = int(session.bet * mines_multiplier(session.safe_picks))
+    db.close_mines_session(session.user_id)
+    db.add_balance(session.user_id, total_return)
+    db.log_game(session.user_id, "mines", session.bet, total_return - session.bet)
+    session.active = 0
+    await callback.message.edit_text(
+        f"{render_header('Кэшаут', emoji.mine())}\n"
+        f"Безопасных клеток: <b>{session.safe_picks}</b>\n"
+        f"Возврат: <b>{format_money(total_return)}</b>\n"
+        f"{emoji.coin()} Сделка по минам закрыта.",
+        reply_markup=mines_keyboard(session, revealed=True),
+    )
+    await callback.answer("Банк забран.")
+
+
+@router.callback_query(F.data == "menu:close")
+async def close_menu_callback_handler(callback: CallbackQuery) -> None:
+    if callback.message is not None:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Меню закрыто.")
+
+
+@router.callback_query(F.data.startswith("game:"))
+async def game_select_callback_handler(callback: CallbackQuery) -> None:
+    assert callback.from_user is not None
+    if callback.message is None:
+        await callback.answer("Сообщение не найдено.", show_alert=True)
+        return
+
+    action = str(callback.data)
+    if action == "game:mines":
+        pending_game_actions[callback.from_user.id] = "mines"
+        await callback.message.edit_text(
+            "Мины выбраны.\nВведи сумму следующим сообщением, например: <code>300</code>"
+        )
+        await callback.answer("Жду сумму для мин.")
+        return
+
+    if action == "game:trade":
+        pending_game_actions[callback.from_user.id] = "trade"
+        await callback.message.edit_text(
+            "Трейд выбран.\nВведи сумму следующим сообщением, например: <code>200</code>"
+        )
+        await callback.answer("Жду сумму для трейда.")
+        return
+
+    await callback.answer("Неизвестная игра.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("job:set:"))
+async def set_job_callback_handler(callback: CallbackQuery) -> None:
+    _, emoji, db = get_runtime()
+    assert callback.from_user is not None
+    db.ensure_user(callback.from_user.id, callback.from_user.username)
+    job_key = str(callback.data).split(":")[-1]
+    if job_key not in JOBS:
+        await callback.answer("Такой профессии нет.", show_alert=True)
+        return
+
+    db.set_job(callback.from_user.id, job_key)
+    job = JOBS[job_key]
+    if callback.message is not None:
+        user = db.get_user(callback.from_user.id)
+        await callback.message.edit_text(
+            f"{render_header('Профессия обновлена', emoji.work())}\n"
+            f"Теперь ты: <b>{html.escape(str(job['title']))}</b>\n"
+            f"{html.escape(str(job['flavor']))}",
+            reply_markup=jobs_keyboard(str(user["current_job"])),
+        )
+    await callback.answer("Профессия изменена.")
+
+
+@router.message()
+async def pending_game_amount_handler(message: Message) -> None:
+    assert message.from_user is not None
+    action = pending_game_actions.get(message.from_user.id)
+    if action is None:
+        return
+
+    bet = parse_bet(message.text)
+    if bet is None:
+        await message.answer(
+            "Сумма должна быть положительным числом. Введи только число, например <code>300</code>.",
+            reply_markup=input_menu_keyboard(),
+        )
+        return
+
+    pending_game_actions.pop(message.from_user.id, None)
+
+    if action == "mines":
+        text, temp_session = prepare_mines_action(
+            message.from_user.id,
+            message.from_user.username,
+            message.chat.id,
+            bet,
+        )
+        if temp_session is None:
+            await message.answer(text, reply_markup=input_menu_keyboard())
+            return
+        sent = await message.answer(text, reply_markup=mines_keyboard(temp_session))
+        _, _, db = get_runtime()
+        temp_session.message_id = sent.message_id
+        if not db.start_mines_session(temp_session):
+            await sent.edit_text(
+                "Не удалось открыть сессию. Проверь баланс и попробуй снова.",
+                reply_markup=None,
+            )
+        return
+
+    if action == "trade":
+        text = perform_trade_action(message.from_user.id, message.from_user.username, bet, None)
+        await message.answer(text, reply_markup=input_menu_keyboard())
+        return
+
+
+@router.inline_query()
+async def inline_query_handler(inline_query: InlineQuery) -> None:
+    runtime_settings, emoji, db = get_runtime()
+    db.ensure_user(inline_query.from_user.id, inline_query.from_user.username)
+    user = db.get_user(inline_query.from_user.id)
+
+    raw_query = (inline_query.query or "").strip().lower()
+    query = raw_query or "all"
+    job = JOBS.get(str(user["current_job"]), JOBS["courier"])
+    results: list[InlineQueryResultArticle] = []
+
+    if query in {"all", "balance", "bal"}:
+        results.append(
+            build_inline_article(
+                "balance",
+                "Баланс",
+                f"{format_money(int(user['balance']))} | lvl {int(user['level'])} | {job['title']}",
+                f"{render_header('Баланс', emoji.coin())}\n"
+                f"Кэш: <b>{format_money(int(user['balance']))}</b>\n"
+                f"{render_profile_block(user)}",
+            )
+        )
+
+    if query in {"all", "work", "job", "shift"}:
+        now = int(time.time())
+        next_available = int(user["last_work_at"]) + runtime_settings.work_cooldown_seconds
+        if now < next_available:
+            work_description = f"Кулдаун: {seconds_to_text(next_available - now)}"
+            work_text = (
+                f"{render_header('Статус смены', emoji.work())}\n"
+                f"Профессия: <b>{html.escape(str(job['title']))}</b>\n"
+                f"Следующая смена через <b>{seconds_to_text(next_available - now)}</b>."
+            )
+        else:
+            work_description = "Смена готова прямо сейчас"
+            work_text = (
+                f"{render_header('Статус смены', emoji.work())}\n"
+                f"Профессия: <b>{html.escape(str(job['title']))}</b>\n"
+                "Смена готова. Можно жать <code>/work</code>."
+            )
+        results.append(
+            build_inline_article(
+                "work",
+                "Статус работы",
+                work_description,
+                work_text,
+            )
+        )
+
+    if query in {"all", "jobs", "job"}:
+        job_lines = [render_header("Профессии", emoji.work())]
+        for key, data in JOBS.items():
+            marker = "▸" if key == str(user["current_job"]) else "•"
+            job_lines.append(
+                f"{marker} <b>{html.escape(str(data['title']))}</b> - <code>{key}</code>"
+            )
+        results.append(
+            build_inline_article(
+                "jobs",
+                "Профессии",
+                f"Текущая: {job['title']}",
+                "\n".join(job_lines),
+            )
+        )
+
+    if query in {"all", "inventory", "inv"}:
+        items = db.get_inventory(inline_query.from_user.id)
+        if items:
+            item_lines = [render_header("Инвентарь", emoji.coin())]
+            for item in items[:8]:
+                item_lines.append(
+                    f"• {html.escape(str(item['item_name']))} x<b>{int(item['quantity'])}</b>"
+                )
+            inventory_text = "\n".join(item_lines)
+            inventory_description = f"{len(items)} предметов"
+        else:
+            inventory_text = (
+                f"{render_header('Инвентарь', emoji.coin())}\n"
+                "Пока пусто. Предметы падают со смен и мини-игр."
+            )
+            inventory_description = "Пока пусто"
+        results.append(
+            build_inline_article(
+                "inventory",
+                "Инвентарь",
+                inventory_description,
+                inventory_text,
+            )
+        )
+
+    if query in {"all", "logs", "worklog"}:
+        logs = db.get_recent_work_logs(inline_query.from_user.id, limit=4)
+        if logs:
+            log_lines = [render_header("Последние смены", emoji.work())]
+            for row in logs:
+                log_lines.append(render_work_log_entry(row))
+            log_text = "\n".join(log_lines)
+            log_description = f"{len(logs)} последних смен"
+        else:
+            log_text = (
+                f"{render_header('Последние смены', emoji.work())}\n"
+                "Логов пока нет. Первая запись появится после <code>/work</code>."
+            )
+            log_description = "Логов пока нет"
+        results.append(
+            build_inline_article(
+                "worklog",
+                "Логи смен",
+                log_description,
+                log_text,
+            )
+        )
+
+    if not results:
+        results.append(
+            build_inline_article(
+                "help",
+                "Подсказка",
+                "Запросы: balance, work, jobs, inventory, logs",
+                f"{render_header('Inline режим', emoji.coin())}\n"
+                "Запросы: <code>balance</code>, <code>work</code>, <code>jobs</code>, "
+                "<code>inventory</code>, <code>logs</code>.",
+            )
+        )
+
+    await inline_query.answer(results, cache_time=1, is_personal=True)
+
+
+@router.message(F.entities)
+async def custom_emoji_debug_handler(message: Message) -> None:
+    found_ids: list[str] = []
+    for entity in message.entities or []:
+        if entity.type == "custom_emoji" and entity.custom_emoji_id:
+            found_ids.append(entity.custom_emoji_id)
+
+    if not found_ids:
+        return
+
+    lines = ["Найдены custom emoji id:"]
+    for emoji_id in found_ids:
+        lines.append(f"<code>{emoji_id}</code>")
+    await message.answer("\n".join(lines))
+
+
+async def main() -> None:
+    global settings, emoji_set, db
+    settings = Settings.from_env()
+    emoji_set = EmojiSet(settings)
+    db = GameDB(DB_PATH)
+    bot = Bot(
+        settings.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+    dispatcher = Dispatcher()
+    dispatcher.include_router(router)
+    await dispatcher.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
