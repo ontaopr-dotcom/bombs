@@ -177,6 +177,17 @@ class MinesSession:
     active: int
 
 
+@dataclass
+class AuctionListing:
+    id: int
+    seller_id: int
+    item_name: str
+    quantity: int
+    price_per_unit: int
+    created_at: int
+    active: int
+
+
 class EmojiSet:
     def __init__(self, settings: Settings) -> None:
         self._premium_ids = {
@@ -299,6 +310,19 @@ class GameDB:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auction_listings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                seller_id INTEGER NOT NULL,
+                item_name TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                price_per_unit INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            )
+            """
+        )
         self._ensure_user_columns()
         self.conn.commit()
 
@@ -388,6 +412,39 @@ class GameDB:
             (user_id, item_name, quantity),
         )
         self.conn.commit()
+
+    def remove_item(self, user_id: int, item_name: str, quantity: int = 1) -> bool:
+        current = self.get_item_quantity(user_id, item_name)
+        if current < quantity:
+            return False
+        self.conn.execute(
+            """
+            UPDATE inventory
+            SET quantity = quantity - ?
+            WHERE user_id = ? AND item_name = ?
+            """,
+            (quantity, user_id, item_name),
+        )
+        self.conn.execute(
+            """
+            DELETE FROM inventory
+            WHERE user_id = ? AND item_name = ? AND quantity <= 0
+            """,
+            (user_id, item_name),
+        )
+        self.conn.commit()
+        return True
+
+    def get_item_quantity(self, user_id: int, item_name: str) -> int:
+        row = self.conn.execute(
+            """
+            SELECT quantity
+            FROM inventory
+            WHERE user_id = ? AND item_name = ?
+            """,
+            (user_id, item_name),
+        ).fetchone()
+        return int(row["quantity"]) if row is not None else 0
 
     def get_inventory(self, user_id: int) -> list[sqlite3.Row]:
         return self.conn.execute(
@@ -572,6 +629,156 @@ class GameDB:
             return False
         return True
 
+    def create_auction_listing(
+        self,
+        seller_id: int,
+        item_name: str,
+        quantity: int,
+        price_per_unit: int,
+    ) -> AuctionListing | None:
+        try:
+            with self.conn:
+                stock = self.conn.execute(
+                    """
+                    SELECT quantity
+                    FROM inventory
+                    WHERE user_id = ? AND item_name = ?
+                    """,
+                    (seller_id, item_name),
+                ).fetchone()
+                if stock is None or int(stock["quantity"]) < quantity:
+                    return None
+                self.conn.execute(
+                    """
+                    UPDATE inventory
+                    SET quantity = quantity - ?
+                    WHERE user_id = ? AND item_name = ?
+                    """,
+                    (quantity, seller_id, item_name),
+                )
+                self.conn.execute(
+                    """
+                    DELETE FROM inventory
+                    WHERE user_id = ? AND item_name = ? AND quantity <= 0
+                    """,
+                    (seller_id, item_name),
+                )
+                cursor = self.conn.execute(
+                    """
+                    INSERT INTO auction_listings (
+                        seller_id, item_name, quantity, price_per_unit, created_at, active
+                    )
+                    VALUES (?, ?, ?, ?, ?, 1)
+                    """,
+                    (seller_id, item_name, quantity, price_per_unit, int(time.time())),
+                )
+                listing_id = int(cursor.lastrowid)
+        except sqlite3.Error:
+            return None
+        return self.get_auction_listing(listing_id)
+
+    def get_auction_listing(self, listing_id: int) -> AuctionListing | None:
+        row = self.conn.execute(
+            """
+            SELECT id, seller_id, item_name, quantity, price_per_unit, created_at, active
+            FROM auction_listings
+            WHERE id = ?
+            """,
+            (listing_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return AuctionListing(**dict(row))
+
+    def get_active_auction_listings(self, limit: int = 10) -> list[AuctionListing]:
+        rows = self.conn.execute(
+            """
+            SELECT id, seller_id, item_name, quantity, price_per_unit, created_at, active
+            FROM auction_listings
+            WHERE active = 1
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [AuctionListing(**dict(row)) for row in rows]
+
+    def buy_auction_listing(
+        self,
+        listing_id: int,
+        buyer_id: int,
+        quantity: int,
+    ) -> tuple[bool, str, AuctionListing | None, int]:
+        try:
+            with self.conn:
+                row = self.conn.execute(
+                    """
+                    SELECT id, seller_id, item_name, quantity, price_per_unit, created_at, active
+                    FROM auction_listings
+                    WHERE id = ? AND active = 1
+                    """,
+                    (listing_id,),
+                ).fetchone()
+                if row is None:
+                    return False, "Лот не найден или уже закрыт.", None, 0
+
+                listing = AuctionListing(**dict(row))
+                if listing.seller_id == buyer_id:
+                    return False, "Нельзя выкупить собственный лот.", listing, 0
+                if quantity <= 0 or quantity > listing.quantity:
+                    return False, "Некорректное количество для покупки.", listing, 0
+
+                total_price = listing.price_per_unit * quantity
+                buyer = self.conn.execute(
+                    "SELECT balance FROM users WHERE user_id = ?",
+                    (buyer_id,),
+                ).fetchone()
+                if buyer is None or int(buyer["balance"]) < total_price:
+                    return False, "Недостаточно средств для покупки.", listing, 0
+
+                self.conn.execute(
+                    "UPDATE users SET balance = balance - ? WHERE user_id = ?",
+                    (total_price, buyer_id),
+                )
+                self.conn.execute(
+                    "UPDATE users SET balance = balance + ? WHERE user_id = ?",
+                    (total_price, listing.seller_id),
+                )
+                self.conn.execute(
+                    """
+                    INSERT INTO inventory (user_id, item_name, quantity)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(user_id, item_name)
+                    DO UPDATE SET quantity = quantity + excluded.quantity
+                    """,
+                    (buyer_id, listing.item_name, quantity),
+                )
+
+                remaining = listing.quantity - quantity
+                if remaining <= 0:
+                    self.conn.execute(
+                        """
+                        UPDATE auction_listings
+                        SET quantity = 0, active = 0
+                        WHERE id = ?
+                        """,
+                        (listing_id,),
+                    )
+                else:
+                    self.conn.execute(
+                        """
+                        UPDATE auction_listings
+                        SET quantity = ?
+                        WHERE id = ?
+                        """,
+                        (remaining, listing_id),
+                    )
+        except sqlite3.Error:
+            return False, "Не удалось провести сделку.", None, 0
+
+        updated = self.get_auction_listing(listing_id)
+        return True, "ok", updated, total_price
+
 
 def format_money(amount: int) -> str:
     return f"{amount:,}".replace(",", " ")
@@ -608,6 +815,10 @@ def parse_user_id(raw: str | None) -> int | None:
     except ValueError:
         return None
     return user_id if user_id > 0 else None
+
+
+def parse_positive_quantity(raw: str | None) -> int | None:
+    return parse_bet(raw)
 
 
 def xp_to_level(xp: int) -> int:
@@ -672,16 +883,33 @@ def render_jobs_text(user: sqlite3.Row, emoji: EmojiSet) -> str:
             f"{mark} <code>{key}</code> - <b>{html.escape(str(data['title']))}</b>, "
             f"{html.escape(str(data['flavor']))}{alias_suffix}"
         )
-    lines.append("\nСменить можно кнопками ниже или через <code>/job trader</code>.")
+    lines.append("\nСменить можно кнопками ниже.")
     return "\n".join(lines)
 
 
 def render_inventory_text(items: list[sqlite3.Row], emoji: EmojiSet) -> str:
     if not items:
-        return f"{render_header('Инвентарь', emoji.coin())}\nПока пусто. Иди в <code>/work</code>."
+        return f"{render_header('Инвентарь', emoji.coin())}\nПока пусто. Загляни в работу."
     lines = [render_header("Инвентарь", emoji.coin())]
     for item in items[:12]:
         lines.append(f"• {html.escape(str(item['item_name']))} x<b>{int(item['quantity'])}</b>")
+    return "\n".join(lines)
+
+
+def render_auction_text(listings: list[AuctionListing], emoji: EmojiSet) -> str:
+    lines = [render_header("Аукцион", emoji.coin())]
+    if not listings:
+        lines.append("Активных лотов нет. Первый лот можно выставить вручную.")
+        return "\n".join(lines)
+
+    for listing in listings:
+        total = listing.quantity * listing.price_per_unit
+        lines.append(
+            f"• Лот <code>#{listing.id}</code> - {html.escape(listing.item_name)} x<b>{listing.quantity}</b> "
+            f"по <b>{format_money(listing.price_per_unit)}</b> за шт. "
+            f"(всего {format_money(total)}), продавец <code>{listing.seller_id}</code>"
+        )
+    lines.append("\nПокупка и выставление сейчас доступны через ручной ввод.")
     return "\n".join(lines)
 
 
@@ -705,7 +933,7 @@ def input_menu_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton(text="Баланс"), KeyboardButton(text="Работа")],
             [KeyboardButton(text="Игры"), KeyboardButton(text="Профессии")],
-            [KeyboardButton(text="Инвентарь"), KeyboardButton(text="Логи смен")],
+            [KeyboardButton(text="Инвентарь"), KeyboardButton(text="Аукцион")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выбери раздел или введи команду",
@@ -721,6 +949,25 @@ def games_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="Мины", callback_data="game:mines"),
             ],
+        ]
+    )
+
+
+def replay_keyboard(game_name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Сыграть снова", callback_data=f"game:{game_name}")],
+            [InlineKeyboardButton(text="Закрыть", callback_data="menu:close")],
+        ]
+    )
+
+
+def trade_direction_keyboard(bet: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Поставить вверх", callback_data=f"trade:dir:{bet}:up")],
+            [InlineKeyboardButton(text="Поставить вниз", callback_data=f"trade:dir:{bet}:down")],
+            [InlineKeyboardButton(text="Закрыть", callback_data="menu:close")],
         ]
     )
 
@@ -747,7 +994,9 @@ def trade_round(bet: int, direction: str, house_edge_percent: int) -> tuple[bool
         delta = delta_magnitude if won else -delta_magnitude
     else:
         delta = -delta_magnitude if won else delta_magnitude
-    payout = bet if won else -bet
+    payout = max(1, round(bet * abs(delta) / 100))
+    if not won:
+        payout = -payout
     return won, payout, delta
 
 
@@ -814,7 +1063,7 @@ router = Router()
 settings: Settings | None = None
 emoji_set: EmojiSet | None = None
 db: GameDB | None = None
-pending_game_actions: dict[int, str] = {}
+pending_game_actions: dict[int, dict[str, int | str]] = {}
 
 
 def get_runtime() -> tuple[Settings, EmojiSet, GameDB]:
@@ -884,7 +1133,7 @@ def perform_work_action(user_id: int, username: str | None) -> tuple[str, bool]:
         html.escape(flavor),
         f"Доход: <b>+{format_money(reward)}</b>",
         f"XP: <b>+{xp_gain}</b>",
-        f"{emoji.coin()} Баланс: <b>{format_money(new_balance)}</b>",
+        f"{emoji.coin()} Получено: <b>+{format_money(reward)}</b>",
         f"Уровень: <b>{int(user_after['level'])}</b>",
     ]
     if item_drop is not None:
@@ -915,13 +1164,14 @@ def perform_trade_action(
         return f"Недостаточно средств. Баланс: <b>{format_money(balance)}</b>"
 
     won, payout, delta = trade_round(bet, direction, runtime_settings.house_edge_percent)
-    new_balance = db.add_balance(user_id, payout)
+    db.add_balance(user_id, payout)
     db.log_game(user_id, "trade", bet, payout)
     direction_emoji = emoji.up() if direction == "up" else emoji.down()
     direction_label = "up" if direction == "up" else "down"
     result_line = "Импульс пойман." if won else "Ликвидность вынесла твою сторону."
     change_sign = "+" if delta >= 0 else ""
     money_sign = "+" if payout >= 0 else ""
+    flow_label = "Получено" if payout >= 0 else "Потрачено"
     return (
         f"{render_header('Сделка закрыта', direction_emoji)}\n"
         f"Ставка: <b>{format_money(bet)}</b>\n"
@@ -929,7 +1179,7 @@ def perform_trade_action(
         f"Свеча: <b>{change_sign}{delta:.2f}%</b>\n"
         f"P&amp;L: <b>{money_sign}{format_money(payout)}</b>\n"
         f"{result_line}\n"
-        f"{emoji.coin()} Баланс: <b>{format_money(new_balance)}</b>"
+        f"{emoji.coin()} {flow_label}: <b>{money_sign}{format_money(payout)}</b>"
     )
 
 
@@ -982,14 +1232,8 @@ async def start_handler(message: Message) -> None:
         f"{render_header('Подпольный терминал запущен', emoji.coin())}\n"
         f"Стартовый баланс: <b>{format_money(int(user['balance']))}</b>\n"
         f"{render_profile_block(user)}\n\n"
-        "Команды:\n"
-        "/balance\n"
-        "/work\n"
-        "/job\n"
-        "/inventory\n"
-        "/trade 200\n"
-        "/mines 300\n\n"
-        f"Юзернейм бота: <code>{html.escape(runtime_settings.bot_username)}</code>"
+        "Весь основной сценарий доступен через кнопки ниже.\n"
+        "Игры, профессии, инвентарь и аукцион открываются из меню."
     )
     await message.answer(text, reply_markup=input_menu_keyboard())
 
@@ -1000,22 +1244,13 @@ async def help_handler(message: Message) -> None:
     admin_lines = ""
     if message.from_user is not None and is_admin(message.from_user.id, runtime_settings):
         admin_lines = (
-            "\n\nАдмин:\n"
-            "/give &lt;user_id&gt; &lt;amount&gt; - выдать деньги\n"
-            "/resetwork &lt;user_id&gt; - сбросить кулдаун работы\n"
-            "/worklog &lt;user_id&gt; - логи смен пользователя"
+            "\n\nАдминские команды и отладочные сценарии доступны отдельно."
         )
     text = (
         f"{render_header('Режимы', emoji.work())}\n"
-        "/work - отработать смену и получить XP\n"
-        "/balance - баланс, уровень и текущая профессия\n"
-        "/job - список профессий\n"
-        "/worklog - последние смены\n"
-        "/job trader - сменить профессию\n"
-        "/inventory - показать предметы\n"
-        "/emoji_debug - как снять custom_emoji_id\n"
-        "/trade &lt;ставка&gt; - быстрая сделка\n"
-        "/mines &lt;ставка&gt; - открыть интерактивное поле с минами"
+        "Пользуйся кнопками внизу.\n"
+        "Через меню доступны баланс, работа, профессии, игры, инвентарь и аукцион.\n"
+        "В играх после выбора просто вводи сумму следующим сообщением."
         f"{admin_lines}"
     )
     await message.answer(text, reply_markup=input_menu_keyboard())
@@ -1137,7 +1372,7 @@ async def job_handler(message: Message) -> None:
 
     job_key = resolve_job_key(parts[1])
     if job_key is None:
-        await message.answer("Такой профессии нет. Открой <code>/job</code> и выбери из списка.")
+        await message.answer("Такой профессии нет. Выбери вариант из списка ниже.")
         return
     db.set_job(message.from_user.id, job_key)
     job = JOBS[job_key]
@@ -1159,6 +1394,106 @@ async def inventory_handler(message: Message) -> None:
     await message.answer(render_inventory_text(items, emoji), reply_markup=input_menu_keyboard())
 
 
+@router.message(Command("auction"))
+@router.message(F.text.lower() == "аукцион")
+async def auction_handler(message: Message) -> None:
+    _, emoji, db = get_runtime()
+    listings = db.get_active_auction_listings()
+    await message.answer(render_auction_text(listings, emoji), reply_markup=input_menu_keyboard())
+
+
+@router.message(Command("auction_sell"))
+async def auction_sell_handler(message: Message) -> None:
+    _, emoji, db = get_runtime()
+    assert message.from_user is not None
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    parts = (message.text or "").split()
+    if len(parts) < 4:
+        await message.answer(
+            "Использование: <code>/auction_sell Звёздный нефрит 2 500</code>",
+            reply_markup=input_menu_keyboard(),
+        )
+        return
+
+    quantity = parse_positive_quantity(parts[-2])
+    price_per_unit = parse_bet(parts[-1])
+    item_name = " ".join(parts[1:-2]).strip()
+    if not item_name or quantity is None or price_per_unit is None:
+        await message.answer(
+            "Нужны корректные название, количество и цена за штуку.",
+            reply_markup=input_menu_keyboard(),
+        )
+        return
+
+    listing = db.create_auction_listing(
+        seller_id=message.from_user.id,
+        item_name=item_name,
+        quantity=quantity,
+        price_per_unit=price_per_unit,
+    )
+    if listing is None:
+        stock = db.get_item_quantity(message.from_user.id, item_name)
+        await message.answer(
+            f"Не удалось выставить лот. У тебя этого предмета: <b>{stock}</b>.",
+            reply_markup=input_menu_keyboard(),
+        )
+        return
+
+    total = listing.quantity * listing.price_per_unit
+    await message.answer(
+        f"{render_header('Лот выставлен', emoji.coin())}\n"
+        f"Лот: <code>#{listing.id}</code>\n"
+        f"Предмет: <b>{html.escape(listing.item_name)}</b>\n"
+        f"Количество: <b>{listing.quantity}</b>\n"
+        f"Цена за шт.: <b>{format_money(listing.price_per_unit)}</b>\n"
+        f"Всего: <b>{format_money(total)}</b>",
+        reply_markup=input_menu_keyboard(),
+    )
+
+
+@router.message(Command("auction_buy"))
+async def auction_buy_handler(message: Message) -> None:
+    _, emoji, db = get_runtime()
+    assert message.from_user is not None
+    db.ensure_user(message.from_user.id, message.from_user.username)
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: <code>/auction_buy 12 2</code>",
+            reply_markup=input_menu_keyboard(),
+        )
+        return
+
+    listing_id = parse_bet(parts[1])
+    quantity = parse_positive_quantity(parts[2]) if len(parts) > 2 else 1
+    if listing_id is None or quantity is None:
+        await message.answer(
+            "Нужны корректные id лота и количество.",
+            reply_markup=input_menu_keyboard(),
+        )
+        return
+
+    success, result, listing, total_price = db.buy_auction_listing(
+        listing_id=listing_id,
+        buyer_id=message.from_user.id,
+        quantity=quantity,
+    )
+    if not success:
+        await message.answer(result, reply_markup=input_menu_keyboard())
+        return
+
+    balance = int(db.get_user(message.from_user.id)["balance"])
+    remaining = listing.quantity if listing is not None else 0
+    await message.answer(
+        f"{render_header('Покупка закрыта', emoji.coin())}\n"
+        f"Лот: <code>#{listing_id}</code>\n"
+        f"Списано: <b>{format_money(total_price)}</b>\n"
+        f"Новый баланс: <b>{format_money(balance)}</b>\n"
+        f"Остаток в лоте: <b>{remaining}</b>",
+        reply_markup=input_menu_keyboard(),
+    )
+
+
 @router.message(Command("emoji_debug"))
 async def emoji_debug_handler(message: Message) -> None:
     await message.answer(
@@ -1178,7 +1513,7 @@ async def work_handler(message: Message) -> None:
 @router.message(F.text.lower() == "игры")
 async def games_menu_handler(message: Message) -> None:
     await message.answer(
-        "Выбери мини-игру. После выбора я попрошу сумму следующим сообщением.",
+        "Выбери мини-игру. После выбора просто вводи сумму. Если ошибёшься, можно сразу написать ещё раз.",
         reply_markup=games_keyboard(),
     )
 
@@ -1186,6 +1521,7 @@ async def games_menu_handler(message: Message) -> None:
 @router.message(Command("trade"))
 @router.message(F.text.startswith("/trade@"))
 async def trade_handler(message: Message) -> None:
+    runtime_settings, _, _ = get_runtime()
     assert message.from_user is not None
     parts = (message.text or "").split()
     if len(parts) < 2:
@@ -1200,9 +1536,15 @@ async def trade_handler(message: Message) -> None:
     if bet is None:
         await message.answer("Ставка должна быть положительным числом.", reply_markup=input_menu_keyboard())
         return
+    if bet < runtime_settings.trade_min_bet:
+        await message.answer(
+            f"Минимальная ставка для трейда: <b>{runtime_settings.trade_min_bet}</b>",
+            reply_markup=input_menu_keyboard(),
+        )
+        return
 
     text = perform_trade_action(message.from_user.id, message.from_user.username, bet, direction)
-    await message.answer(text, reply_markup=input_menu_keyboard())
+    await message.answer(text, reply_markup=replay_keyboard("trade"))
 
 
 @router.message(Command("mines"))
@@ -1273,7 +1615,7 @@ async def mines_open_handler(callback: CallbackQuery) -> None:
             f"{render_header('Подрыв', emoji.mine())}\n"
             f"Ставка сгорела: <b>{format_money(session.bet)}</b>\n"
             f"{emoji.coin()} Не твоя карта сегодня.",
-            reply_markup=mines_keyboard(session, emoji, revealed=True, exploded=True),
+            reply_markup=replay_keyboard("mines"),
         )
         await callback.answer("Мина.")
         return
@@ -1291,7 +1633,7 @@ async def mines_open_handler(callback: CallbackQuery) -> None:
             f"{render_header('Поле зачищено', emoji.mine())}\n"
             f"Все безопасные клетки взяты.\n"
             f"Выплата: <b>{format_money(current_cashout)}</b>",
-            reply_markup=mines_keyboard(session, emoji, revealed=True),
+            reply_markup=replay_keyboard("mines"),
         )
         await callback.answer("Максимум взят.")
         return
@@ -1331,7 +1673,7 @@ async def mines_cashout_handler(callback: CallbackQuery) -> None:
         f"Безопасных клеток: <b>{session.safe_picks}</b>\n"
         f"Возврат: <b>{format_money(total_return)}</b>\n"
         f"{emoji.coin()} Сделка по минам закрыта.",
-        reply_markup=mines_keyboard(session, emoji, revealed=True),
+        reply_markup=replay_keyboard("mines"),
     )
     await callback.answer("Банк забран.")
 
@@ -1343,6 +1685,34 @@ async def close_menu_callback_handler(callback: CallbackQuery) -> None:
     await callback.answer("Меню закрыто.")
 
 
+@router.callback_query(F.data.startswith("trade:dir:"))
+async def trade_direction_callback_handler(callback: CallbackQuery) -> None:
+    assert callback.from_user is not None
+    if callback.message is None:
+        await callback.answer("Сообщение не найдено.", show_alert=True)
+        return
+
+    parts = str(callback.data).split(":")
+    if len(parts) != 4:
+        await callback.answer("Некорректная позиция.", show_alert=True)
+        return
+
+    bet = parse_bet(parts[2])
+    direction = parts[3]
+    if bet is None or direction not in {"up", "down"}:
+        await callback.answer("Некорректная позиция.", show_alert=True)
+        return
+
+    text = perform_trade_action(
+        callback.from_user.id,
+        callback.from_user.username,
+        bet,
+        direction,
+    )
+    await callback.message.edit_text(text, reply_markup=replay_keyboard("trade"))
+    await callback.answer("Позиция открыта.")
+
+
 @router.callback_query(F.data.startswith("game:"))
 async def game_select_callback_handler(callback: CallbackQuery) -> None:
     assert callback.from_user is not None
@@ -1352,7 +1722,11 @@ async def game_select_callback_handler(callback: CallbackQuery) -> None:
 
     action = str(callback.data)
     if action == "game:mines":
-        pending_game_actions[callback.from_user.id] = "mines"
+        pending_game_actions[callback.from_user.id] = {
+            "action": "mines",
+            "chat_id": callback.message.chat.id,
+            "prompt_message_id": callback.message.message_id,
+        }
         await callback.message.edit_text(
             "Мины выбраны.\nВведи сумму следующим сообщением, например: <code>300</code>"
         )
@@ -1360,7 +1734,11 @@ async def game_select_callback_handler(callback: CallbackQuery) -> None:
         return
 
     if action == "game:trade":
-        pending_game_actions[callback.from_user.id] = "trade"
+        pending_game_actions[callback.from_user.id] = {
+            "action": "trade",
+            "chat_id": callback.message.chat.id,
+            "prompt_message_id": callback.message.message_id,
+        }
         await callback.message.edit_text(
             "Трейд выбран.\nВведи сумму следующим сообщением, например: <code>200</code>"
         )
@@ -1395,22 +1773,43 @@ async def set_job_callback_handler(callback: CallbackQuery) -> None:
 
 @router.message()
 async def pending_game_amount_handler(message: Message) -> None:
+    runtime_settings, _, _ = get_runtime()
     assert message.from_user is not None
-    action = pending_game_actions.get(message.from_user.id)
-    if action is None:
+    state = pending_game_actions.get(message.from_user.id)
+    if state is None:
         return
+    action = str(state["action"])
 
     bet = parse_bet(message.text)
     if bet is None:
+        try:
+            await message.delete()
+        except Exception:
+            pass
         await message.answer(
-            "Сумма должна быть положительным числом. Введи только число, например <code>300</code>.",
-            reply_markup=input_menu_keyboard(),
+            "Сумма должна быть положительным числом. Просто введи число ещё раз, например <code>300</code>.",
         )
         return
 
-    pending_game_actions.pop(message.from_user.id, None)
+    min_bet = (
+        runtime_settings.trade_min_bet if action == "trade" else runtime_settings.mines_min_bet
+    )
+    if bet < min_bet:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        label = "трейда" if action == "trade" else "мин"
+        await message.answer(f"Минимальная ставка для {label}: <b>{min_bet}</b>")
+        return
 
     if action == "mines":
+        pending_game_actions.pop(message.from_user.id, None)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        prompt_message_id = int(state.get("prompt_message_id", 0))
         text, temp_session = prepare_mines_action(
             message.from_user.id,
             message.from_user.username,
@@ -1421,18 +1820,70 @@ async def pending_game_amount_handler(message: Message) -> None:
             await message.answer(text, reply_markup=input_menu_keyboard())
             return
         _, emoji, db = get_runtime()
-        sent = await message.answer(text, reply_markup=mines_keyboard(temp_session, emoji))
-        temp_session.message_id = sent.message_id
+        if prompt_message_id:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=prompt_message_id,
+                    text=text,
+                    reply_markup=mines_keyboard(temp_session, emoji),
+                )
+                temp_session.message_id = prompt_message_id
+            except Exception:
+                sent = await message.answer(text, reply_markup=mines_keyboard(temp_session, emoji))
+                temp_session.message_id = sent.message_id
+        else:
+            sent = await message.answer(text, reply_markup=mines_keyboard(temp_session, emoji))
+            temp_session.message_id = sent.message_id
         if not db.start_mines_session(temp_session):
-            await sent.edit_text(
-                "Не удалось открыть сессию. Проверь баланс и попробуй снова.",
-                reply_markup=None,
-            )
+            if temp_session.message_id == prompt_message_id and prompt_message_id:
+                try:
+                    await message.bot.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=prompt_message_id,
+                        text="Не удалось открыть сессию. Проверь баланс и попробуй снова.",
+                        reply_markup=replay_keyboard("mines"),
+                    )
+                except Exception:
+                    await message.answer(
+                        "Не удалось открыть сессию. Проверь баланс и попробуй снова.",
+                        reply_markup=replay_keyboard("mines"),
+                    )
+            else:
+                await message.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=temp_session.message_id,
+                    text="Не удалось открыть сессию. Проверь баланс и попробуй снова.",
+                    reply_markup=replay_keyboard("mines"),
+                )
         return
 
     if action == "trade":
-        text = perform_trade_action(message.from_user.id, message.from_user.username, bet, None)
-        await message.answer(text, reply_markup=input_menu_keyboard())
+        pending_game_actions.pop(message.from_user.id, None)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        prompt_message_id = int(state.get("prompt_message_id", 0))
+        if prompt_message_id:
+            try:
+                await message.bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=prompt_message_id,
+                    text=(
+                        "Выбери позицию.\n"
+                        f"Сумма: <b>{format_money(bet)}</b>\n"
+                        "Куда ставишь?"
+                    ),
+                    reply_markup=trade_direction_keyboard(bet),
+                )
+                return
+            except Exception:
+                pass
+        await message.answer(
+            "Выбери позицию.",
+            reply_markup=trade_direction_keyboard(bet),
+        )
         return
 
 
