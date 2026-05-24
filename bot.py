@@ -141,6 +141,10 @@ class Settings:
     premium_emoji_mine_id: str
     premium_emoji_coin_id: str
     premium_emoji_work_id: str
+    premium_emoji_gem_id: str
+    premium_emoji_explosion_id: str
+    premium_emoji_hidden_id: str
+    premium_emoji_empty_id: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -162,6 +166,10 @@ class Settings:
             premium_emoji_mine_id=os.getenv("PREMIUM_EMOJI_MINE_ID", "").strip(),
             premium_emoji_coin_id=os.getenv("PREMIUM_EMOJI_COIN_ID", "").strip(),
             premium_emoji_work_id=os.getenv("PREMIUM_EMOJI_WORK_ID", "").strip(),
+            premium_emoji_gem_id=os.getenv("PREMIUM_EMOJI_GEM_ID", "").strip(),
+            premium_emoji_explosion_id=os.getenv("PREMIUM_EMOJI_EXPLOSION_ID", "").strip(),
+            premium_emoji_hidden_id=os.getenv("PREMIUM_EMOJI_HIDDEN_ID", "").strip(),
+            premium_emoji_empty_id=os.getenv("PREMIUM_EMOJI_EMPTY_ID", "").strip(),
         )
 
 
@@ -196,6 +204,10 @@ class EmojiSet:
             "mine": settings.premium_emoji_mine_id,
             "coin": settings.premium_emoji_coin_id,
             "work": settings.premium_emoji_work_id,
+            "gem": settings.premium_emoji_gem_id,
+            "explosion": settings.premium_emoji_explosion_id,
+            "hidden": settings.premium_emoji_hidden_id,
+            "empty": settings.premium_emoji_empty_id,
         }
 
     @staticmethod
@@ -821,6 +833,14 @@ def parse_positive_quantity(raw: str | None) -> int | None:
     return parse_bet(raw)
 
 
+def collect_custom_emoji_ids(message: Message) -> list[str]:
+    found_ids: list[str] = []
+    for entity in (message.entities or []) + (message.caption_entities or []):
+        if entity.type == "custom_emoji" and entity.custom_emoji_id:
+            found_ids.append(entity.custom_emoji_id)
+    return found_ids
+
+
 def xp_to_level(xp: int) -> int:
     return max(1, 1 + xp // 100)
 
@@ -899,7 +919,8 @@ def render_inventory_text(items: list[sqlite3.Row], emoji: EmojiSet) -> str:
 def render_auction_text(listings: list[AuctionListing], emoji: EmojiSet) -> str:
     lines = [render_header("Аукцион", emoji.coin())]
     if not listings:
-        lines.append("Активных лотов нет. Первый лот можно выставить вручную.")
+        lines.append("Активных лотов нет.")
+        lines.append("Ниже можно обновить список, выставить новый лот или купить существующий.")
         return "\n".join(lines)
 
     for listing in listings:
@@ -909,7 +930,7 @@ def render_auction_text(listings: list[AuctionListing], emoji: EmojiSet) -> str:
             f"по <b>{format_money(listing.price_per_unit)}</b> за шт. "
             f"(всего {format_money(total)}), продавец <code>{listing.seller_id}</code>"
         )
-    lines.append("\nПокупка и выставление сейчас доступны через ручной ввод.")
+    lines.append("\nДействия доступны кнопками ниже.")
     return "\n".join(lines)
 
 
@@ -957,6 +978,17 @@ def replay_keyboard(game_name: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Сыграть снова", callback_data=f"game:{game_name}")],
+            [InlineKeyboardButton(text="Закрыть", callback_data="menu:close")],
+        ]
+    )
+
+
+def auction_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Обновить", callback_data="auction:refresh")],
+            [InlineKeyboardButton(text="Выставить лот", callback_data="auction:sell")],
+            [InlineKeyboardButton(text="Купить лот", callback_data="auction:buy")],
             [InlineKeyboardButton(text="Закрыть", callback_data="menu:close")],
         ]
     )
@@ -1064,6 +1096,7 @@ settings: Settings | None = None
 emoji_set: EmojiSet | None = None
 db: GameDB | None = None
 pending_game_actions: dict[int, dict[str, int | str]] = {}
+pending_auction_actions: dict[int, dict[str, int | str]] = {}
 
 
 def get_runtime() -> tuple[Settings, EmojiSet, GameDB]:
@@ -1399,7 +1432,7 @@ async def inventory_handler(message: Message) -> None:
 async def auction_handler(message: Message) -> None:
     _, emoji, db = get_runtime()
     listings = db.get_active_auction_listings()
-    await message.answer(render_auction_text(listings, emoji), reply_markup=input_menu_keyboard())
+    await message.answer(render_auction_text(listings, emoji), reply_markup=auction_keyboard())
 
 
 @router.message(Command("auction_sell"))
@@ -1685,6 +1718,55 @@ async def close_menu_callback_handler(callback: CallbackQuery) -> None:
     await callback.answer("Меню закрыто.")
 
 
+@router.callback_query(F.data.startswith("auction:"))
+async def auction_callback_handler(callback: CallbackQuery) -> None:
+    _, emoji, db = get_runtime()
+    assert callback.from_user is not None
+    if callback.message is None:
+        await callback.answer("Сообщение не найдено.", show_alert=True)
+        return
+
+    action = str(callback.data).split(":")[-1]
+    if action == "refresh":
+        listings = db.get_active_auction_listings()
+        await callback.message.edit_text(
+            render_auction_text(listings, emoji),
+            reply_markup=auction_keyboard(),
+        )
+        await callback.answer("Список обновлён.")
+        return
+
+    if action == "sell":
+        pending_auction_actions[callback.from_user.id] = {
+            "action": "sell",
+            "prompt_message_id": callback.message.message_id,
+        }
+        await callback.message.edit_text(
+            "Выставление лота.\n"
+            "Введи следующим сообщением: <code>название | количество | цена</code>\n"
+            "Пример: <code>Звёздный нефрит | 2 | 500</code>",
+            reply_markup=auction_keyboard(),
+        )
+        await callback.answer("Жду параметры лота.")
+        return
+
+    if action == "buy":
+        pending_auction_actions[callback.from_user.id] = {
+            "action": "buy",
+            "prompt_message_id": callback.message.message_id,
+        }
+        await callback.message.edit_text(
+            "Покупка лота.\n"
+            "Введи следующим сообщением: <code>id | количество</code>\n"
+            "Пример: <code>12 | 2</code>",
+            reply_markup=auction_keyboard(),
+        )
+        await callback.answer("Жду параметры покупки.")
+        return
+
+    await callback.answer("Неизвестное действие.", show_alert=True)
+
+
 @router.callback_query(F.data.startswith("trade:dir:"))
 async def trade_direction_callback_handler(callback: CallbackQuery) -> None:
     assert callback.from_user is not None
@@ -1775,6 +1857,187 @@ async def set_job_callback_handler(callback: CallbackQuery) -> None:
 async def pending_game_amount_handler(message: Message) -> None:
     runtime_settings, _, _ = get_runtime()
     assert message.from_user is not None
+    found_ids = collect_custom_emoji_ids(message)
+    if found_ids:
+        lines = [
+            f"{render_header('Найдены premium emoji', '🧩')}",
+            "Вот их id. Эти значения можно вставлять в <code>.env</code>:",
+        ]
+        for emoji_id in found_ids:
+            lines.append(f"<code>{emoji_id}</code>")
+        await message.answer("\n".join(lines))
+        return
+
+    auction_state = pending_auction_actions.get(message.from_user.id)
+    if auction_state is not None:
+        _, emoji, db = get_runtime()
+        raw_text = (message.text or "").strip()
+        prompt_message_id = int(auction_state.get("prompt_message_id", 0))
+        action = str(auction_state["action"])
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+        if action == "sell":
+            parts = [part.strip() for part in raw_text.split("|")]
+            if len(parts) != 3:
+                if prompt_message_id:
+                    try:
+                        await message.bot.edit_message_text(
+                            chat_id=message.chat.id,
+                            message_id=prompt_message_id,
+                            text=(
+                                "Неверный формат.\n"
+                                "Введи: <code>название | количество | цена</code>\n"
+                                "Пример: <code>Звёздный нефрит | 2 | 500</code>"
+                            ),
+                            reply_markup=auction_keyboard(),
+                        )
+                    except Exception:
+                        pass
+                return
+
+            item_name = parts[0]
+            quantity = parse_positive_quantity(parts[1])
+            price_per_unit = parse_bet(parts[2])
+            if not item_name or quantity is None or price_per_unit is None:
+                if prompt_message_id:
+                    try:
+                        await message.bot.edit_message_text(
+                            chat_id=message.chat.id,
+                            message_id=prompt_message_id,
+                            text=(
+                                "Некорректные параметры лота.\n"
+                                "Введи: <code>название | количество | цена</code>"
+                            ),
+                            reply_markup=auction_keyboard(),
+                        )
+                    except Exception:
+                        pass
+                return
+
+            listing = db.create_auction_listing(
+                seller_id=message.from_user.id,
+                item_name=item_name,
+                quantity=quantity,
+                price_per_unit=price_per_unit,
+            )
+            if listing is None:
+                stock = db.get_item_quantity(message.from_user.id, item_name)
+                if prompt_message_id:
+                    try:
+                        await message.bot.edit_message_text(
+                            chat_id=message.chat.id,
+                            message_id=prompt_message_id,
+                            text=(
+                                f"Не удалось выставить лот.\n"
+                                f"У тебя этого предмета: <b>{stock}</b>."
+                            ),
+                            reply_markup=auction_keyboard(),
+                        )
+                    except Exception:
+                        pass
+                return
+
+            pending_auction_actions.pop(message.from_user.id, None)
+            total = listing.quantity * listing.price_per_unit
+            result_text = (
+                f"{render_header('Лот выставлен', emoji.coin())}\n"
+                f"Лот: <code>#{listing.id}</code>\n"
+                f"Предмет: <b>{html.escape(listing.item_name)}</b>\n"
+                f"Количество: <b>{listing.quantity}</b>\n"
+                f"Цена за шт.: <b>{format_money(listing.price_per_unit)}</b>\n"
+                f"Всего: <b>{format_money(total)}</b>"
+            )
+            if prompt_message_id:
+                try:
+                    await message.bot.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=prompt_message_id,
+                        text=result_text,
+                        reply_markup=auction_keyboard(),
+                    )
+                    return
+                except Exception:
+                    pass
+            await message.answer(result_text, reply_markup=auction_keyboard())
+            return
+
+        if action == "buy":
+            parts = [part.strip() for part in raw_text.split("|")]
+            if len(parts) not in {1, 2}:
+                if prompt_message_id:
+                    try:
+                        await message.bot.edit_message_text(
+                            chat_id=message.chat.id,
+                            message_id=prompt_message_id,
+                            text=(
+                                "Неверный формат.\n"
+                                "Введи: <code>id | количество</code>\n"
+                                "Пример: <code>12 | 2</code>"
+                            ),
+                            reply_markup=auction_keyboard(),
+                        )
+                    except Exception:
+                        pass
+                return
+
+            listing_id = parse_bet(parts[0])
+            quantity = parse_positive_quantity(parts[1]) if len(parts) == 2 else 1
+            if listing_id is None or quantity is None:
+                if prompt_message_id:
+                    try:
+                        await message.bot.edit_message_text(
+                            chat_id=message.chat.id,
+                            message_id=prompt_message_id,
+                            text="Некорректные id лота или количество.",
+                            reply_markup=auction_keyboard(),
+                        )
+                    except Exception:
+                        pass
+                return
+
+            success, result, listing, total_price = db.buy_auction_listing(
+                listing_id=listing_id,
+                buyer_id=message.from_user.id,
+                quantity=quantity,
+            )
+            if not success:
+                if prompt_message_id:
+                    try:
+                        await message.bot.edit_message_text(
+                            chat_id=message.chat.id,
+                            message_id=prompt_message_id,
+                            text=result,
+                            reply_markup=auction_keyboard(),
+                        )
+                    except Exception:
+                        pass
+                return
+
+            pending_auction_actions.pop(message.from_user.id, None)
+            remaining = listing.quantity if listing is not None else 0
+            result_text = (
+                f"{render_header('Покупка закрыта', emoji.coin())}\n"
+                f"Лот: <code>#{listing_id}</code>\n"
+                f"Списано: <b>{format_money(total_price)}</b>\n"
+                f"Остаток в лоте: <b>{remaining}</b>"
+            )
+            if prompt_message_id:
+                try:
+                    await message.bot.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=prompt_message_id,
+                        text=result_text,
+                        reply_markup=auction_keyboard(),
+                    )
+                    return
+                except Exception:
+                    pass
+            await message.answer(result_text, reply_markup=auction_keyboard())
+            return
+
     state = pending_game_actions.get(message.from_user.id)
     if state is None:
         return
@@ -2017,15 +2280,15 @@ async def inline_query_handler(inline_query: InlineQuery) -> None:
 
 @router.message(F.entities)
 async def custom_emoji_debug_handler(message: Message) -> None:
-    found_ids: list[str] = []
-    for entity in message.entities or []:
-        if entity.type == "custom_emoji" and entity.custom_emoji_id:
-            found_ids.append(entity.custom_emoji_id)
+    found_ids = collect_custom_emoji_ids(message)
 
     if not found_ids:
         return
 
-    lines = ["Найдены custom emoji id:"]
+    lines = [
+        f"{render_header('Найдены premium emoji', '🧩')}",
+        "Вот их id. Эти значения можно вставлять в <code>.env</code>:",
+    ]
     for emoji_id in found_ids:
         lines.append(f"<code>{emoji_id}</code>")
     await message.answer("\n".join(lines))
