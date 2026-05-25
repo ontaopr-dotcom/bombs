@@ -4,49 +4,22 @@
 
 - `работа` с профессиями, уровнями и лутом
 - структурированные логи смен
-- `трейд` вверх/вниз
 - интерактивные `мины` через inline-кнопки
 - главное меню и выбор профессий через inline-кнопки
 - инвентарь
-- inline-режим через `@бот query`
 - поддержка premium/custom emoji через `custom_emoji_id`
 
 ## Запуск
 
 ```bash
-cd /home/user/bots/main
+mkdir main
+cd ~/main
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 touch .env
 python3 bot.py
 ```
-
-## Команды
-
-- `/start`
-- `/help`
-- `/balance`
-- `/work`
-- `/worklog`
-- `/job`
-- `/job <name>`
-- `/inventory`
-- `/trade <bet>`
-- `/mines <bet>`
-
-Примеры:
-
-```text
-/trade 200
-/job trader
-/mines 300
-@your_bot_username balance
-```
-
-## Inline mode
-
-После включения inline mode в BotFather можно вызывать бота так:
 
 ## Premium emoji
 
